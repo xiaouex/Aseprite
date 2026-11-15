@@ -1,4 +1,5 @@
 name: Auto build Aseprite
+
 on:
   workflow_dispatch:
     inputs:
@@ -138,6 +139,12 @@ jobs:
           fi
           echo "bundled curl major=$curl_major -> ${TLS_OPTS[*]}"
 
+          # libarchive（Aseprite 1.4+ 新加的依赖）默认 ENABLE_OPENSSL=ON，
+          # 只要机器上装了 OpenSSL（GitHub runner 自带 C:\Program Files\OpenSSL），
+          # 它就会把 libcrypto.lib 链进 archive_static，最终变成
+          # libcrypto-3-x64.dll 依赖。必须显式关掉。
+          TLS_OPTS+=(-DENABLE_OPENSSL=OFF -DCMAKE_DISABLE_FIND_PACKAGE_OpenSSL=ON)
+
           cmake -S aseprite -B aseprite/build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DENABLE_TESTS=OFF \
@@ -151,6 +158,25 @@ jobs:
             -DSKIA_LIBRARY="$SKIA_LIB" \
             -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
             "${TLS_OPTS[@]}"
+
+      # 3.5) 快速体检：配置阶段就能看出谁把 OpenSSL 链进来了，
+      #      不用等 20 分钟编译完才发现（link.txt 是 configure 阶段生成的）
+      - name: Check no target links OpenSSL
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo '--- CMakeCache 里的 OpenSSL 相关项 ---'
+          grep -iE '^(OPENSSL|ENABLE_OPENSSL|CMAKE_DISABLE_FIND_PACKAGE_OPENSSL)' \
+            aseprite/build/CMakeCache.txt || echo '(无)'
+
+          bad=$(grep -ril -E 'libcrypto|libssl' --include='link.txt' aseprite/build 2>/dev/null || true)
+          if [ -n "${bad}" ]; then
+            echo "::error::下面这些 target 的链接命令里出现了 libcrypto/libssl："
+            echo "${bad}"
+            grep -ih -E 'libcrypto|libssl' ${bad} | head -n 5 || true
+            exit 1
+          fi
+          echo 'OK：没有任何 target 链接 OpenSSL'
 
       # 4) 编译（Ninja 自带并行；windows-latest 4 核大约 15~25 分钟）
       - name: Build
