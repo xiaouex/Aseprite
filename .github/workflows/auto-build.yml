@@ -1,63 +1,279 @@
 name: Auto build Aseprite
-
 on:
-  push:
-    branches: main
-
   workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Aseprite 的分支 / tag / commit（例如 v1.3.14.2 或 main）'
+        required: true
+        default: 'main'
+      create_release:
+        description: '构建完成后创建 GitHub Release（会公开分发，务必先读 EULA）'
+        type: boolean
+        default: false
+  push:
+    tags:
+      - 'v*'
+
+# 同一 ref 同时只跑一个，避免并发抢占
+concurrency:
+  group: aseprite-${{ github.ref }}-${{ inputs.ref || 'tag' }}
+  cancel-in-progress: true
 
 permissions:
-  contents: write
+  contents: write   # create_release 需要；不会自动发布，除非勾选
+
+env:
+  # 用 github.event.inputs 而不是 inputs.*，这样 workflow_dispatch 和 push tag 都可用
+  ASEPRITE_REF: ${{ github.event.inputs.ref || github.ref_name }}
 
 jobs:
-  auto-build:
-    name: Auto build Aseprite for Windows x64
-    runs-on: windows-2022
+  build-windows-x64:
+    name: Windows x64 (MSVC + Skia)
+    runs-on: windows-latest
+    timeout-minutes: 90
 
     steps:
-      - name: Checkout repository
+      # 1) 拉取 Aseprite 源码 + 所有 submodule（laf / curl / libpng / lua ...）
+      - name: Checkout Aseprite (with submodules)
         uses: actions/checkout@v4
+        with:
+          repository: aseprite/aseprite
+          ref: ${{ env.ASEPRITE_REF }}
+          path: aseprite
+          submodules: recursive
+          # 浅克隆即可（含 submodule），能省好几分钟；tag 构建仍然能拿到正确版本
+          fetch-depth: 1
 
-      - name: Install Python requirements
+      # 2) 找到当前版本配套的 Skia 预编译包（版本必须和 Aseprite 对齐，
+      #    否则 laf 编译会报 Skia 头文件/符号不匹配）
+      - name: Resolve Skia URL
+        shell: bash
+        id: skia
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          set -euo pipefail
+          cd aseprite
 
-      - name: Download Aseprite
+          url=""
+          # 新版本把 URL 放在 laf/misc/skia-url.sh；老版本写在 INSTALL.md 里
+          for f in laf/misc/skia-url.sh INSTALL.md docs/INSTALL.md; do
+            [ -f "$f" ] || continue
+            found=$(grep -hoE 'https://github\.com/aseprite/skia/releases/download/[A-Za-z0-9._~/?=&%+@-]*Skia-Windows-Release-x64\.zip' "$f" | head -n1 || true)
+            if [ -n "$found" ]; then url="$found"; break; fi
+          done
+
+          # 兜底：Aseprite m124 对应的 Windows 包
+          if [ -z "$url" ]; then
+            url="https://github.com/aseprite/skia/releases/download/m124-08a5439a6b/Skia-Windows-Release-x64.zip"
+          fi
+
+          echo "Skia 包: $url"
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Download & extract Skia
+        shell: bash
         run: |
-          python download.py
+          set -euo pipefail
+          # Skia 包 ≈ 70MB，偶尔会 502，重试几次
+          for i in 1 2 3 4; do
+            if curl --fail --location --retry 3 --retry-delay 5 \
+                 -o skia.zip "${{ steps.skia.outputs.url }}"; then
+              break
+            fi
+            echo "下载失败，第 $i 次重试..."
+            sleep 10
+          done
+
+          mkdir -p skia
+          unzip -q skia.zip -d skia
+
+          # 目录结构固定是 out/Release-x64/skia.lib
+          ls -la skia/out/Release-x64
+          test -f skia/out/Release-x64/skia.lib
 
       - name: Setup Ninja
-        uses: ashutoshvarma/setup-ninja@v1.1
+        uses: aseprite/get-ninja@main
 
-      - name: Setup MSVC Developer Command Prompt
-        uses: TheMrMilchmann/setup-msvc-dev@v3
+      - name: Setup MSVC (x64)
+        uses: TheMrMilchmann/setup-msvc-dev@v4
         with:
           arch: x64
 
-      - name: Build Aseprite
+      # 3) 配置：关闭 OpenSSL、改用 Windows 原生 Schannel。
+      #    这几个 -D 在新版本里上游已经默认写了，老版本里由我们补上；
+      #    CMake 对没用到的变量只会打一条 warning，不会影响构建。
+      - name: Configure (CMake + Ninja)
+        shell: bash
         run: |
-          mkdir build
-          cd build
-          cmake "${{ github.workspace }}/src/aseprite" -G Ninja -DCMAKE_BUILD_TYPE=MinSizeRel -DLAF_BACKEND=skia -DSKIA_DIR="${{ github.workspace }}/src/skia" -DSKIA_LIBRARY_DIR="${{ github.workspace }}/src/skia/out/Release-x64" -DSKIA_LIBRARY="${{ github.workspace }}/src/skia/out/Release-x64/skia.lib"
-          cmake --build . --config MinSizeRel --target aseprite
-          copy "C:/Windows/System32/libcrypto-1_1-x64.dll" ./bin
+          set -euo pipefail
 
-      - name: Get version
-        id: get_version
+          # cygpath -m 得到 D:/a/xxx/xxx 这种 CMake 能认的混合路径
+          SKIA_DIR="$(cygpath -m "$PWD/skia")"
+          SKIA_LIB_DIR="$SKIA_DIR/out/Release-x64"
+
+          # 新版 laf 只认 SKIA_LIBRARY_DIR；老版 laf 还需要 SKIA_LIBRARY 指向 .lib
+          SKIA_LIB="$SKIA_LIB_DIR/skia.lib"
+          [ -f "$SKIA_LIB" ] || SKIA_LIB="$SKIA_LIB_DIR/libskia.a"
+
+          echo "SKIA_DIR=$SKIA_DIR"
+          echo "SKIA_LIB=$SKIA_LIB"
+
+          cmake -S aseprite -B aseprite/build -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DENABLE_TESTS=OFF \
+            -DENABLE_SCRIPTING=ON \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_NEWS=ON \
+            -DENABLE_UPDATER=ON \
+            -DLAF_BACKEND=skia \
+            -DSKIA_DIR="$SKIA_DIR" \
+            -DSKIA_LIBRARY_DIR="$SKIA_LIB_DIR" \
+            -DSKIA_LIBRARY="$SKIA_LIB" \
+            -DCMAKE_USE_OPENSSL=OFF \
+            -DCMAKE_USE_SCHANNEL=ON \
+            -DCMAKE_USE_WINSSL=ON \
+            -DCMAKE_USE_LIBSSH2=OFF \
+            -DCURL_USE_OPENSSL=OFF \
+            -DCURL_USE_SCHANNEL=ON
+
+      # 4) 编译（Ninja 自带并行；windows-latest 4 核大约 15~25 分钟）
+      - name: Build
+        shell: bash
         run: |
-          $version = Get-Content version.txt
-          echo "version=$version" >> $env:GITHUB_OUTPUT
+          set -euo pipefail
+          cmake --build aseprite/build --parallel
 
-      - name: Zip Aseprite
+      # 5) 依赖体检：exe 依赖的 DLL 必须全部是 Windows 自带组件。
+      #    只要出现 libcrypto / libssl / libcurl / zlib1 / MSVCP140 之类，
+      #    说明静态链接没生效，直接让 CI 失败（而不是等用户下载后才发现）。
+      - name: Verify no external DLL dependency
+        shell: pwsh
         run: |
-          cd build/bin
-          7z a ../../Aseprite-Windows-x64-${{ steps.get_version.outputs.version }}.zip *
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'aseprite\build\bin\aseprite.exe'
+          if (-not (Test-Path $exe)) { throw "找不到 $exe，构建可能失败了" }
 
-      - name: GH Release
+          $dumpbin = Get-Command dumpbin.exe -ErrorAction SilentlyContinue
+          if (-not $dumpbin) {
+            Write-Host '::warning::找不到 dumpbin.exe，跳过依赖检查'
+            exit 0
+          }
+
+          $out  = (& $dumpbin.Source /nologo /dependents $exe 2>&1 | Out-String)
+          $dlls = [regex]::Matches($out, '(?im)^\s+([A-Za-z0-9_.\-]+\.dll)\s*$') |
+                    ForEach-Object { $_.Groups[1].Value } |
+                    Sort-Object -Unique
+
+          if (-not $dlls -or $dlls.Count -eq 0) {
+            Write-Host $out
+            throw '无法从 dumpbin 输出里解析出依赖 DLL，检查一下 dumpbin 是否可用'
+          }
+
+          Write-Host '=== aseprite.exe 依赖的 DLL ==='
+          $dlls | ForEach-Object { Write-Host "  $_" }
+
+          # 明令禁止的三方库（即使系统里恰好有，也不能依赖）
+          $forbidden = $dlls | Where-Object {
+              $_ -match '(?i)^(libcrypto|libssl|libcurl|zlib1?|libpng\d*|libwebp|libssh2|libarchive)'
+          }
+
+          # 静态 CRT 检查：/MT 编译不应该出现 VC 运行时
+          $crt = $dlls | Where-Object { $_ -match '(?i)^(VCRUNTIME|MSVCP|CONCRT|ucrtbased)' }
+
+          # System32 里没有的 DLL 就是“用户机器上大概率缺失”的可再分发库
+          $sys32   = Join-Path $env:SystemRoot 'System32'
+          $missing = $dlls | Where-Object { -not (Test-Path (Join-Path $sys32 $_)) }
+
+          $fail = $false
+          if ($forbidden) {
+            Write-Host "::error::仍然依赖第三方/OpenSSL DLL: $($forbidden -join ', ')"
+            $fail = $true
+          }
+          if ($crt) {
+            Write-Host "::error::依赖 VC 运行时: $($crt -join ', ')（应使用 /MT 静态 CRT）"
+            $fail = $true
+          }
+          if ($missing) {
+            Write-Host "::error::以下 DLL 不在 System32，解压后会提示缺少文件: $($missing -join ', ')"
+            $fail = $true
+          }
+          if ($fail) { exit 1 }
+
+          Write-Host 'OK：exe 只依赖 Windows 系统组件，单文件即可运行。'
+
+      # 6) 打包便携版（exe + data/ + aseprite.ini），和官网 zip 的结构一致
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bin = Join-Path $env:GITHUB_WORKSPACE 'aseprite\build\bin'
+          if (-not (Test-Path (Join-Path $bin 'data'))) {
+            throw "缺少 $bin\data 目录，Aseprite 启动时会找不到 gui.xml 等资源"
+          }
+
+          $ver   = ($env:ASEPRITE_REF -replace '[^A-Za-z0-9._-]', '-')
+          $stage = Join-Path $env:RUNNER_TEMP 'Aseprite-portable'
+          Remove-Item $stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $stage | Out-Null
+
+          Copy-Item (Join-Path $bin 'aseprite.exe') $stage
+          Copy-Item (Join-Path $bin 'data') (Join-Path $stage 'data') -Recurse
+          # 有这个文件 = 便携模式，配置写在 exe 同目录
+          Set-Content (Join-Path $stage 'aseprite.ini') `
+            -Value '# portable mode' -Encoding utf8
+
+          $zip = Join-Path $env:GITHUB_WORKSPACE "Aseprite-$ver-windows-x64.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          Write-Host "产物: $zip"
+
+          "ASEPRITE_ZIP=$zip"               | Out-File $env:GITHUB_ENV -Append
+          "ASEPRITE_VER=$ver"               | Out-File $env:GITHUB_ENV -Append
+
+      # 7) 冒烟测试：能打印版本号就说明 EXE 不缺 DLL、能启动
+      - name: Smoke test (aseprite --version)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $exe = Join-Path $env:GITHUB_WORKSPACE 'aseprite\build\bin\aseprite.exe'
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' `
+                 -NoNewWindow -PassThru -RedirectStandardOutput "$env:RUNNER_TEMP\v.txt"
+          if (-not $p.WaitForExit(60000)) { $p.Kill(); throw 'aseprite --version 超时' }
+          Get-Content "$env:RUNNER_TEMP\v.txt" -ErrorAction SilentlyContinue
+          if ($p.ExitCode -ne 0) { throw "exit code = $($p.ExitCode)" }
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Aseprite-${{ env.ASEPRITE_VER }}-windows-x64
+          path: ${{ env.ASEPRITE_ZIP }}
+          if-no-files-found: error
+          retention-days: 30
+
+      # 8) 可选：发 Release。
+      #    ⚠️ Aseprite EULA (b) 禁止把二进制分发给第三方，公开 Release 属于违规。
+      #    仅在自己私有仓库、且只给自己用时才勾选；否则用 artifact 下载即可。
+      - name: Create GitHub Release
+        if: ${{ github.event.inputs.create_release == 'true' && startsWith(env.ASEPRITE_REF, 'v') }}
         uses: softprops/action-gh-release@v2
         with:
-          name: Aseprite-Windows-x64-${{ steps.get_version.outputs.version }}
-          tag_name: ${{ steps.get_version.outputs.version }}
-          files: |
-            Aseprite-Windows-x64-${{ steps.get_version.outputs.version }}.zip
+          tag_name: ${{ env.ASEPRITE_REF }}
+          name: Aseprite ${{ env.ASEPRITE_REF }} (Windows x64)
+          files: ${{ env.ASEPRITE_ZIP }}
+          draft: true
+          fail_on_unmatched_files: true
+          body: |
+            自编译的 Aseprite ${{ env.ASEPRITE_REF }} for Windows x64。
+
+            - MSVC 静态链接（/MT），自带 Skia，**不需要任何额外 DLL**
+            - 便携模式（配置文件保存在 aseprite.exe 同目录）
+            - 仅供个人使用，请勿再分发（见 Aseprite EULA 第 (b) 条）
+
+      - name: Summary
+        shell: bash
+        run: |
+          {
+            echo "### Aseprite $ASEPRITE_VER (Windows x64)"
+            echo ""
+            echo "- 源码: \`$ASEPRITE_REF\`"
+            echo "- Skia: \`${{ steps.skia.outputs.url }}\`"
+            echo "- 产物: \`$(basename "$ASEPRITE_ZIP")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
