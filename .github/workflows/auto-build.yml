@@ -99,8 +99,8 @@ jobs:
           arch: x64
 
       # 3) 配置：关闭 OpenSSL、改用 Windows 原生 Schannel。
-      #    这几个 -D 在新版本里上游已经默认写了，老版本里由我们补上；
-      #    CMake 对没用到的变量只会打一条 warning，不会影响构建。
+      #    新版上游已经默认这么设了，老 tag 由我们补上；变量名按 curl 版本自动挑，
+      #    因为 curl 对旧变量名（WINSSL）是直接 FATAL_ERROR，而不是 warning。
       - name: Configure (CMake + Ninja)
         shell: bash
         run: |
@@ -117,6 +117,27 @@ jobs:
           echo "SKIA_DIR=$SKIA_DIR"
           echo "SKIA_LIB=$SKIA_LIB"
 
+          # ---- 关掉 OpenSSL，改用 Windows 自带的 Schannel ----
+          # 这个开关的名字历史上改过两次，传错名字 curl 会直接 FATAL_ERROR：
+          #   curl < 7.79 : CMAKE_USE_WINSSL
+          #   curl 7.79+  : CMAKE_USE_SCHANNEL（旧名字会触发 rename 断言）
+          #   curl 8.x    : CURL_USE_SCHANNEL（CMAKE_USE_* 整套改名）
+          # 所以先看捆绑的 curl 版本，再决定传哪一组。
+          CURL_VER_H="aseprite/third_party/curl/include/curl/curlver.h"
+          CURL_CMAKE="aseprite/third_party/curl/CMakeLists.txt"
+          curl_major=$(grep -oE '#define LIBCURL_VERSION_MAJOR[[:space:]]+[0-9]+' \
+                         "$CURL_VER_H" 2>/dev/null | grep -oE '[0-9]+' | head -n1 || true)
+          [ -n "${curl_major:-}" ] || curl_major=7
+
+          if [ "$curl_major" -ge 8 ]; then
+            TLS_OPTS=(-DCURL_USE_OPENSSL=OFF -DCURL_USE_SCHANNEL=ON -DCURL_USE_LIBSSH2=OFF)
+          elif grep -q 'renamed to CMAKE_USE_SCHANNEL' "$CURL_CMAKE" 2>/dev/null; then
+            TLS_OPTS=(-DCMAKE_USE_OPENSSL=OFF -DCMAKE_USE_SCHANNEL=ON -DCMAKE_USE_LIBSSH2=OFF)
+          else
+            TLS_OPTS=(-DCMAKE_USE_OPENSSL=OFF -DCMAKE_USE_WINSSL=ON -DCMAKE_USE_LIBSSH2=OFF)
+          fi
+          echo "bundled curl major=$curl_major -> ${TLS_OPTS[*]}"
+
           cmake -S aseprite -B aseprite/build -G Ninja \
             -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DENABLE_TESTS=OFF \
@@ -128,12 +149,8 @@ jobs:
             -DSKIA_DIR="$SKIA_DIR" \
             -DSKIA_LIBRARY_DIR="$SKIA_LIB_DIR" \
             -DSKIA_LIBRARY="$SKIA_LIB" \
-            -DCMAKE_USE_OPENSSL=OFF \
-            -DCMAKE_USE_SCHANNEL=ON \
-            -DCMAKE_USE_WINSSL=ON \
-            -DCMAKE_USE_LIBSSH2=OFF \
-            -DCURL_USE_OPENSSL=OFF \
-            -DCURL_USE_SCHANNEL=ON
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            "${TLS_OPTS[@]}"
 
       # 4) 编译（Ninja 自带并行；windows-latest 4 核大约 15~25 分钟）
       - name: Build
